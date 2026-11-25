@@ -30,6 +30,9 @@ import (
 const (
 	// ChunkSize is the size of each snapshot chunk.
 	ChunkSize = settings.SnapshotChunkSize
+	// chunkSendAttempts is the number of attempts made to send a chunk before
+	// the stream is considered failed.
+	chunkSendAttempts = 2
 )
 
 var _ io.WriteCloser = (*ChunkWriter)(nil)
@@ -80,9 +83,6 @@ func (cw *ChunkWriter) Write(data []byte) (int, error) {
 }
 
 func (cw *ChunkWriter) onNewBlock(data []byte, crc []byte) error {
-	defer func() {
-		cw.chunkID = cw.chunkID + 1
-	}()
 	chunk := cw.getChunk()
 	var payload []byte
 	if cw.chunkID == 0 {
@@ -94,20 +94,26 @@ func (cw *ChunkWriter) onNewBlock(data []byte, crc []byte) error {
 	payload = append(payload, crc...)
 	chunk.Data = payload
 	chunk.ChunkSize = uint64(len(payload))
-	return cw.onNewChunk(chunk)
+	if err := cw.onNewChunk(chunk); err != nil {
+		return err
+	}
+	cw.chunkID = cw.chunkID + 1
+	return nil
 }
 
 func (cw *ChunkWriter) onNewChunk(chunk pb.Chunk) error {
-	sent, stopped := cw.sink.Receive(chunk)
-	if stopped {
-		cw.stopped = true
-		return sm.ErrSnapshotStopped
+	for attempt := 0; attempt < chunkSendAttempts; attempt++ {
+		sent, stopped := cw.sink.Receive(chunk)
+		if stopped {
+			cw.stopped = true
+			return sm.ErrSnapshotStopped
+		}
+		if sent {
+			return nil
+		}
 	}
-	if !sent {
-		cw.failed = true
-		return sm.ErrSnapshotStreaming
-	}
-	return nil
+	cw.failed = true
+	return sm.ErrSnapshotStreaming
 }
 
 func (cw *ChunkWriter) getHeader() []byte {

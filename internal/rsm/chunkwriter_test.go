@@ -28,9 +28,14 @@ type testSink struct {
 	chunks     []pb.Chunk
 	sendFailed bool
 	stopped    bool
+	failFirst  bool
 }
 
 func (s *testSink) Receive(chunk pb.Chunk) (bool, bool) {
+	if s.failFirst {
+		s.failFirst = false
+		return false, false
+	}
 	if s.sendFailed || s.stopped {
 		return !s.sendFailed, s.stopped
 	}
@@ -108,6 +113,31 @@ func TestChunkWriterCanFailWrite(t *testing.T) {
 	_, err := cw.Write(data)
 	require.Error(t, err, "writer didn't fail")
 	require.Equal(t, sm.ErrSnapshotStreaming, err, "unexpected err")
+}
+
+func TestFirstChunkFailureDoesNotCreateAGap(t *testing.T) {
+	meta := getTestSSMeta()
+	sink := &testSink{failFirst: true}
+	cw := NewChunkWriter(sink, meta)
+	data := make([]byte, ChunkSize*2+1)
+	n, err := cw.Write(data)
+	require.NoError(t, err, "failed to write the data")
+	require.Equal(t, len(data), n)
+	require.NoError(t, cw.Close(), "failed to flush")
+
+	chunks := sink.chunks
+	require.NotEmpty(t, chunks, "no chunk received")
+	validator := NewSnapshotValidator()
+	for idx, chunk := range chunks {
+		if chunk.IsPoisonChunk() {
+			continue
+		}
+		require.Equal(t, uint64(idx), chunk.ChunkId, "chunk ID gap")
+		require.True(t, validator.AddChunk(chunk.Data, chunk.ChunkId),
+			"invalid chunk %d", chunk.ChunkId)
+	}
+	require.True(t, validator.Validate(), "invalid snapshot stream")
+	require.Equal(t, uint64(0), chunks[0].ChunkId)
 }
 
 func TestChunkWriterCanBeStopped(t *testing.T) {
