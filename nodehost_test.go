@@ -2304,6 +2304,222 @@ func TestNodeHostAddReplica(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
+// scaleOutSM is a monotonically increasing counter used to verify that no
+// committed write is lost or reordered during online membership change.
+type scaleOutSM struct {
+	mu    sync.Mutex
+	count uint64
+}
+
+func (s *scaleOutSM) Update(e sm.Entry) (sm.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.count++
+	return sm.Result{Value: s.count}, nil
+}
+
+func (s *scaleOutSM) Lookup(query interface{}) (interface{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count, nil
+}
+
+func (s *scaleOutSM) SaveSnapshot(w io.Writer,
+	fc sm.ISnapshotFileCollection, done <-chan struct{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, s.count)
+	_, err := w.Write(buf)
+	return err
+}
+
+func (s *scaleOutSM) RecoverFromSnapshot(r io.Reader,
+	files []sm.SnapshotFile, done <-chan struct{}) error {
+	buf := make([]byte, 8)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.count = binary.LittleEndian.Uint64(buf)
+	return nil
+}
+
+func (s *scaleOutSM) Close() error { return nil }
+
+// TestNodeHostOnlineScaleOutAddReplica is the scale out test case - it adds a
+// fourth replica to a running 3 replica shard while a client keeps issuing
+// read/write requests. The client is expected to observe no error and no
+// downtime, membership change is expected to be observed by all replicas and
+// no committed write can be lost.
+func TestNodeHostOnlineScaleOutAddReplica(t *testing.T) {
+	fs := vfs.GetTestFS()
+	require.NoError(t, fs.RemoveAll(singleNodeHostTestDir))
+	defer func() {
+		require.NoError(t, fs.RemoveAll(singleNodeHostTestDir))
+	}()
+	addresses := []string{
+		fmt.Sprintf("localhost:%d", getTestPort()),
+		fmt.Sprintf("localhost:%d", getTestPort()+1),
+		fmt.Sprintf("localhost:%d", getTestPort()+2),
+		fmt.Sprintf("localhost:%d", getTestPort()+3),
+	}
+	newSM := func(uint64, uint64) sm.IStateMachine {
+		return &scaleOutSM{}
+	}
+	rc := config.Config{
+		ShardID:            1,
+		ElectionRTT:        10,
+		HeartbeatRTT:       1,
+		CheckQuorum:        true,
+		SnapshotEntries:    10,
+		CompactionOverhead: 5,
+	}
+	peers := map[uint64]string{1: addresses[0], 2: addresses[1], 3: addresses[2]}
+	hosts := make([]*NodeHost, 4)
+	startHost := func(replicaID uint64, join bool) *NodeHost {
+		dir := fs.PathJoin(singleNodeHostTestDir, fmt.Sprintf("nh%d", replicaID))
+		nhc := config.NodeHostConfig{
+			WALDir:         dir,
+			NodeHostDir:    dir,
+			RTTMillisecond: getRTTMillisecond(fs, dir),
+			RaftAddress:    addresses[replicaID-1],
+			Expert:         getTestExpertConfig(fs),
+		}
+		nh, err := NewNodeHost(nhc)
+		require.NoError(t, err, "failed to create node host %d", replicaID)
+		rc.ReplicaID = replicaID
+		initial := peers
+		if join {
+			initial = map[uint64]string{}
+		}
+		require.NoError(t, nh.StartReplica(initial, join, newSM, rc),
+			"failed to start replica %d", replicaID)
+		hosts[replicaID-1] = nh
+		return nh
+	}
+	for replicaID := uint64(1); replicaID <= 3; replicaID++ {
+		startHost(replicaID, false)
+	}
+	defer func() {
+		for _, nh := range hosts {
+			if nh != nil {
+				nh.Close()
+			}
+		}
+	}()
+	for _, nh := range hosts[:3] {
+		waitForLeaderToBeElected(t, nh, 1)
+	}
+	pto := lpto(hosts[0])
+	// client load, alternate writes and linearizable reads, each successful
+	// write must return a value exactly one greater than the previous one
+	stopC := make(chan struct{})
+	var writeCount, readCount, failedOps uint64
+	var maxGapNanoseconds int64
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		session := hosts[0].GetNoOPSession(1)
+		var expected uint64
+		lastSuccess := time.Now()
+		for {
+			select {
+			case <-stopC:
+				return
+			default:
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), pto)
+			result, err := hosts[0].SyncPropose(ctx, session, make([]byte, 16))
+			cancel()
+			if err != nil {
+				atomic.AddUint64(&failedOps, 1)
+				continue
+			}
+			expected++
+			if result.Value != expected {
+				atomic.AddUint64(&failedOps, 1)
+			}
+			atomic.StoreUint64(&writeCount, expected)
+			now := time.Now()
+			if gap := now.Sub(lastSuccess).Nanoseconds(); gap > atomic.LoadInt64(&maxGapNanoseconds) {
+				atomic.StoreInt64(&maxGapNanoseconds, gap)
+			}
+			lastSuccess = now
+			ctx, cancel = context.WithTimeout(context.Background(), pto)
+			v, err := hosts[0].SyncRead(ctx, 1, nil)
+			cancel()
+			if err != nil {
+				atomic.AddUint64(&failedOps, 1)
+				continue
+			}
+			if v.(uint64) < atomic.LoadUint64(&writeCount) {
+				atomic.AddUint64(&failedOps, 1)
+			}
+			atomic.AddUint64(&readCount, 1)
+		}
+	}()
+	// online membership change, add the fourth replica while the client
+	// load above is running
+	start := time.Now()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), pto)
+		err := hosts[0].SyncRequestAddReplica(ctx, 1, 4, addresses[3], 0)
+		cancel()
+		if err == nil {
+			break
+		}
+		require.True(t, err == ErrTimeout || err == ErrShardNotReady,
+			"unexpected add replica error %v", err)
+	}
+	changeElapsed := time.Since(start)
+	// membership change is expected to be observed by all existing replicas
+	for i, nh := range hosts[:3] {
+		observed := false
+		for j := 0; j < 100; j++ {
+			ctx, cancel := context.WithTimeout(context.Background(), pto)
+			membership, err := nh.SyncGetShardMembership(ctx, 1)
+			cancel()
+			if err == nil && len(membership.Nodes) == 4 {
+				observed = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		require.True(t, observed,
+			"host %d failed to observe the new membership", i)
+	}
+	// start the new replica to join the running shard, no restart of any
+	// existing replica is involved
+	nh4 := startHost(4, true)
+	waitForLeaderToBeElected(t, nh4, 1)
+	// stop the client load, all committed writes must be visible on the
+	// newly joined replica
+	close(stopC)
+	<-clientDone
+	expected := atomic.LoadUint64(&writeCount)
+	require.NotZero(t, expected, "no write completed during the test")
+	caughtUp := false
+	for i := 0; i < 1000; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), pto)
+		v, err := nh4.SyncRead(ctx, 1, nil)
+		cancel()
+		if err == nil && v.(uint64) == expected {
+			caughtUp = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.True(t, caughtUp, "new replica failed to catch up")
+	downtime := time.Duration(atomic.LoadInt64(&maxGapNanoseconds))
+	t.Logf("online scale out completed, membership change took %v, "+
+		"%d writes and %d reads served, longest client observed gap: %v",
+		changeElapsed, expected, atomic.LoadUint64(&readCount), downtime)
+	require.Zero(t, atomic.LoadUint64(&failedOps),
+		"client observed failures during online scale out")
+}
+
 func TestNodeHostGetNodeUser(t *testing.T) {
 	fs := vfs.GetTestFS()
 	to := &testOption{
